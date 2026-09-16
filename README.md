@@ -21,7 +21,7 @@ For local use, keep the key in the ignored `.env` file at the project root:
 GEMINI_API_KEY=your_key_here
 ```
 
-The app loads this with `python-dotenv`. You can also enter a key in the sidebar for a single session. The key is never stored in the course context or written by the app.
+The app loads this with `python-dotenv`. The key is never displayed, stored in the course context, or entered by end users.
 
 For Streamlit Community Cloud or another hosted deployment, do not deploy `.env`. Add this under the app's **Secrets** settings instead:
 
@@ -48,7 +48,7 @@ DATABASE_URL = "postgresql+psycopg://user:password@host:5432/database"
 
 `APP_PASSWORD` protects the study UI for casual/private use. It is a shared password rather than a full user-management system, so do not use it for sensitive data.
 
-The app uses SQLite in local development and stores the file as `history.db`. On a hosted Streamlit deployment, use an external Postgres database through `DATABASE_URL`; the local filesystem may be reset when the app restarts. Tables are created automatically, and completed practice or exam attempts are written immediately and restored into Analytics on the next session.
+The app uses SQLite in local development and stores the file as `history.db`. On a hosted Streamlit deployment, use an external Postgres database through `DATABASE_URL`; the local filesystem may be reset when the app restarts. Tables are created automatically. Completed attempts, verified Practice/Exam questions, verified Market Shock rounds, game sessions, and game outcomes are stored in the database. The app reuses cached questions for the same course-material fingerprint, difficulty, and game track before making another Gemini request.
 
 Install dependencies with `python -m pip install -r requirements.txt`, not `pip install requirements.txt`.
 
@@ -56,6 +56,7 @@ Install dependencies with `python -m pip install -r requirements.txt`, not `pip 
 
 - **Practice:** immediate answer checks and step-by-step explanations.
 - **Exam:** a 10-question run with feedback held until submission.
+- **Market Shock:** guide a fictional economy through 10 course-grounded decisions; audited game rounds are cached and reused to reduce Gemini calls.
 - **Analytics:** topic-level mastery, accuracy, and recent attempts.
 
 Scanned/image-only PDFs need OCR before upload because `PyPDF2` extracts selectable text rather than pixels.
