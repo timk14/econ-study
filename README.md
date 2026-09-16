@@ -2,6 +2,16 @@
 
 A Streamlit economics study studio that turns your own practice exams and solution sets into fresh, course-grounded questions with Google Gemini.
 
+## Study Workspaces
+
+- **Practice:** immediate answer feedback using the verified question bank.
+- **Learning:** guided cards with a learning objective, optional hint, worked reasoning, misconception correction, and adaptive priority for concepts you have missed.
+- **Exam:** a ten-question assessment with answers held until submission.
+- **Market Shock:** a scenario-based economics strategy game.
+- **Analytics:** topic-level performance patterns across study activity.
+
+Question generation supports structured tables for total-cost schedules, demand and supply schedules, GDP components, macroeconomic data, and comparative-advantage comparisons. Graph questions use concept-specific visual models rather than a single generic chart.
+
 ## Run locally
 
 ```bash

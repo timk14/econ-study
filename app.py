@@ -5,6 +5,7 @@ import hmac
 import io
 import json
 import os
+import re
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -13,11 +14,12 @@ from urllib.parse import urlparse
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
 
 try:
-    from sqlalchemy import create_engine, text
+    from sqlalchemy import bindparam, create_engine, text
 except ImportError:
     create_engine = None
     text = None
@@ -40,6 +42,7 @@ except ImportError:
 
 load_dotenv()
 RAG_DATA_DIR = Path(__file__).parent / "rag_data"
+DOCUMENT_CACHE_DIR = Path(__file__).parent / ".document_cache"
 
 
 st.set_page_config(
@@ -101,6 +104,28 @@ QUESTION_SCHEMA = {
         "topic_tag": {"type": "string"},
         "explanation": {"type": "string"},
         "source_reference": {"type": "string"},
+        "data_table": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "columns": {"type": "array", "items": {"type": "string"}},
+                "rows": {
+                    "type": "array",
+                    "items": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+            "required": ["title", "columns", "rows"],
+        },
+        "learning": {
+            "type": "object",
+            "properties": {
+                "objective": {"type": "string"},
+                "hint": {"type": "string"},
+                "worked_steps": {"type": "array", "items": {"type": "string"}},
+                "misconception": {"type": "string"},
+            },
+            "required": ["objective", "hint", "worked_steps", "misconception"],
+        },
     },
     "required": [
         "question", "options", "correct_answer", "topic_tag",
@@ -173,11 +198,22 @@ def init_state() -> None:
         "exam_submitted": False,
         "practice_answer": None,
         "practice_revealed": False,
+        "learning_question": None,
+        "learning_answer": None,
+        "learning_revealed": False,
+        "learning_hint_visible": False,
         "difficulty": "Intermediate",
         "question_loading": False,
         "question_pool": [],
         "question_pool_signature": "",
         "served_question_ids": set(),
+        "recent_question_fingerprints": [],
+        "recent_topic_tags": [],
+        "recent_concept_families": [],
+        "recent_graph_families": [],
+        "question_style": "auto",
+        "question_style_cycle_index": 0,
+        "document_cache_summary": {"cached_files": 0, "total_bytes": 0},
         "game_active": False,
         "game_track": "Mixed Final",
         "game_round": 0,
@@ -339,17 +375,123 @@ def save_attempt(attempt: dict[str, Any]) -> None:
         })
 
 
+def _question_fingerprint(question: dict[str, Any]) -> str:
+    text = f"{question.get('question', '')}|{question.get('source_reference', '')}|{question.get('topic_tag', '')}"
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def question_concept_family(question: dict[str, Any]) -> str:
+    text = " ".join(str(question.get(key, "")) for key in ("topic_tag", "source_reference", "question")).lower()
+    families = {
+        "scarcity_ppf": ("ppf", "production possibil", "opportunity cost", "scarcity"),
+        "trade": ("comparative advantage", "absolute advantage", "tariff", "trade"),
+        "supply_demand": ("supply", "demand", "equilibrium", "consumer surplus", "price ceiling", "price floor"),
+        "elasticity": ("elasticity", "total revenue", "tax incidence"),
+        "production_costs": ("total cost", "fixed cost", "variable cost", "marginal cost", "average cost", "cost curve"),
+        "labor": ("labor", "labour", "wage", "employment", "unemployment", "marginal revenue product"),
+        "gdp_growth": ("gdp", "gross domestic", "real vs", "nominal", "economic growth"),
+        "inflation": ("inflation", "cpi", "deflator", "price level"),
+        "macro_policy": ("aggregate demand", "aggregate supply", "ad-as", "fiscal", "monetary", "interest rate"),
+        "market_structure": ("monopoly", "oligopoly", "perfect competition", "market structure"),
+    }
+    for family, keywords in families.items():
+        if any(keyword in text for keyword in keywords):
+            return family
+    return "general_economics"
+
+
+def question_graph_family(question: dict[str, Any]) -> str:
+    graph_type = infer_graph_type(question.get("question", ""))
+    return graph_type if graph_type != "generic" else "nonvisual"
+
+
+def _question_diversity_sort_key(question: dict[str, Any]) -> tuple[int, int, int, int, int, str]:
+    recent_hashes = set(st.session_state.get("recent_question_fingerprints", [])[-8:])
+    recent_topics = set(st.session_state.get("recent_topic_tags", [])[-3:])
+    recent_concepts = set(st.session_state.get("recent_concept_families", [])[-4:])
+    recent_graphs = set(st.session_state.get("recent_graph_families", [])[-3:])
+    topic = question.get("topic_tag", "General economics")
+    return (
+        1 if _question_fingerprint(question) in recent_hashes else 0,
+        1 if topic in recent_topics else 0,
+        1 if question_concept_family(question) in recent_concepts else 0,
+        1 if question_graph_family(question) in recent_graphs else 0,
+        int(question.get("times_served", 0)),
+        hashlib.sha256((question.get("bank_id") or question.get("question", "")).encode()).hexdigest(),
+    )
+
+
+def order_question_pool(questions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Create a varied serving sequence instead of merely ranking independent rows."""
+    remaining = list(questions)
+    ordered: list[dict[str, Any]] = []
+    selected_topics: set[str] = set()
+    selected_concepts: set[str] = set()
+    selected_graphs: set[str] = set()
+    while remaining:
+        def pool_key(question: dict[str, Any]) -> tuple[int, int, int, int, int, int, str]:
+            base_key = _question_diversity_sort_key(question)
+            topic = question.get("topic_tag", "General economics")
+            concept = question_concept_family(question)
+            graph = question_graph_family(question)
+            return (
+                base_key[0], base_key[1], base_key[2], base_key[3],
+                1 if topic in selected_topics else 0,
+                1 if concept in selected_concepts or graph in selected_graphs else 0,
+                base_key[5],
+            )
+        next_question = min(remaining, key=pool_key)
+        remaining.remove(next_question)
+        ordered.append(next_question)
+        selected_topics.add(next_question.get("topic_tag", "General economics"))
+        selected_concepts.add(question_concept_family(next_question))
+        selected_graphs.add(question_graph_family(next_question))
+    return ordered
+
+
+def _note_question_seen(question: dict[str, Any]) -> None:
+    recent_hashes = st.session_state.get("recent_question_fingerprints", [])
+    recent_hashes.append(_question_fingerprint(question))
+    if len(recent_hashes) > 8:
+        recent_hashes = recent_hashes[-8:]
+    st.session_state.recent_question_fingerprints = recent_hashes
+    topic = question.get("topic_tag", "General economics")
+    recent_topics = st.session_state.get("recent_topic_tags", [])
+    recent_topics.append(topic)
+    if len(recent_topics) > 3:
+        recent_topics = recent_topics[-3:]
+    st.session_state.recent_topic_tags = recent_topics
+    recent_concepts = st.session_state.get("recent_concept_families", [])
+    recent_concepts.append(question_concept_family(question))
+    if len(recent_concepts) > 4:
+        recent_concepts = recent_concepts[-4:]
+    st.session_state.recent_concept_families = recent_concepts
+    recent_graphs = st.session_state.get("recent_graph_families", [])
+    recent_graphs.append(question_graph_family(question))
+    if len(recent_graphs) > 3:
+        recent_graphs = recent_graphs[-3:]
+    st.session_state.recent_graph_families = recent_graphs
+
+
 def load_saved_questions(context_signature: str, difficulty: str) -> list[dict[str, Any]]:
     """Load the least-used verified questions for this exact course library."""
     engine = get_database_engine(database_url())
     with engine.connect() as connection:
         rows = connection.execute(text("""
-            SELECT id, question_json FROM question_bank
-            WHERE context_signature = :context_signature AND difficulty = :difficulty
+            SELECT id, question_json, times_served FROM question_bank
+            WHERE context_signature IN :context_signatures AND difficulty = :difficulty
             ORDER BY times_served ASC, created_at ASC
             LIMIT 100
-        """), {
-            "context_signature": context_signature,
+        """).bindparams(bindparam("context_signatures", expanding=True)), {
+            "context_signatures": [
+                context_signature,
+                *[
+                    hashlib.sha256(
+                        f"{st.session_state.course_context}\n{difficulty}\n{style}".encode()
+                    ).hexdigest()
+                    for style in ("mixed", "graph_heavy", "table_heavy")
+                ],
+            ],
             "difficulty": difficulty,
         }).mappings().all()
     saved_questions = []
@@ -358,6 +500,7 @@ def load_saved_questions(context_signature: str, difficulty: str) -> list[dict[s
             continue
         question = json.loads(row["question_json"])
         question["bank_id"] = row["id"]
+        question["times_served"] = int(row["times_served"])
         saved_questions.append(question)
     return saved_questions
 
@@ -441,6 +584,52 @@ def extract_text(file_name: str, file_bytes: bytes) -> str:
     raise ValueError(f"Unsupported file type: {suffix}")
 
 
+def cached_extract_text(file_name: str, file_bytes: bytes, cache_label: str = "document") -> str:
+    """Parse a PDF or DOCX once and persist the normalized text for reuse."""
+    DOCUMENT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    digest = hashlib.sha256(file_bytes).hexdigest()
+    safe_label = re.sub(r"[^a-zA-Z0-9_-]+", "_", cache_label).strip("_") or "document"
+    cache_path = DOCUMENT_CACHE_DIR / f"{safe_label}-{digest}.json"
+    if cache_path.exists():
+        try:
+            payload = json.loads(cache_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict) and payload.get("text"):
+                return payload["text"]
+        except (OSError, ValueError, TypeError):
+            pass
+    text = extract_text(file_name, file_bytes).strip()
+    payload = {
+        "file_name": file_name,
+        "cache_label": cache_label,
+        "sha256": digest,
+        "text": text,
+        "bytes": len(file_bytes),
+    }
+    cache_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    st.session_state.document_cache_summary = get_document_cache_summary()
+    return text
+
+
+def get_document_cache_summary() -> dict[str, int]:
+    """Return a lightweight summary of cached extracted document text."""
+    DOCUMENT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_files = [path for path in DOCUMENT_CACHE_DIR.glob("*.json") if path.is_file()]
+    total_bytes = sum(path.stat().st_size for path in cache_files)
+    return {
+        "cached_files": len(cache_files),
+        "total_bytes": total_bytes,
+    }
+
+
+def clear_document_cache() -> None:
+    """Remove all cached extracted document text so uploads are reparsed."""
+    DOCUMENT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    for path in list(DOCUMENT_CACHE_DIR.glob("*.json")):
+        if path.is_file():
+            path.unlink(missing_ok=True)
+    st.session_state.document_cache_summary = {"cached_files": 0, "total_bytes": 0}
+
+
 def load_rag_folder() -> None:
     """Index bundled course materials once per app session."""
     if st.session_state.local_context or not RAG_DATA_DIR.exists():
@@ -452,7 +641,8 @@ def load_rag_folder() -> None:
         if not source_path.is_file() or source_path.suffix.lower() not in {".pdf", ".docx"}:
             continue
         try:
-            text = extract_text(source_path.name, source_path.read_bytes()).strip()
+            raw_bytes = source_path.read_bytes()
+            text = cached_extract_text(source_path.name, raw_bytes, cache_label="rag").strip()
             if text:
                 texts.append(f"SOURCE FILE: {source_path.name}\n{text}")
                 names.append(source_path.name)
@@ -487,7 +677,8 @@ def ingest_uploads(uploaded_files: list[Any]) -> None:
     errors: list[str] = []
     for uploaded_file in uploaded_files:
         try:
-            text = extract_text(uploaded_file.name, uploaded_file.getvalue()).strip()
+            raw_bytes = uploaded_file.getvalue()
+            text = cached_extract_text(uploaded_file.name, raw_bytes, cache_label="upload").strip()
             if text:
                 texts.append(f"SOURCE FILE: {uploaded_file.name}\n{text}")
                 names.append(uploaded_file.name)
@@ -505,14 +696,42 @@ def ingest_uploads(uploaded_files: list[Any]) -> None:
         st.sidebar.success(f"Indexed {len(texts)} document(s)")
 
 
-def build_prompt(context_text: str, difficulty: str, question_count: int = 1) -> str:
+def build_prompt(
+    context_text: str,
+    difficulty: str,
+    question_count: int = 1,
+    question_style: str = "mixed",
+) -> str:
     limited_context = context_text[:120000]
     quantity = "one" if question_count == 1 else f"exactly {question_count}"
-    return f"""You are an economics professor and assessment designer.
+    if question_style == "graph_heavy":
+        style_block = """This batch is graph-heavy. Make at least 60% of the questions explicitly about graphs, curves, or charts. The graph topics must be diversified across the core beginning-economics sequence used in accelerated MBA/ABE courses, not all the same kind of chart. Use a rotating mix of these graph families: PPF/opportunity cost, supply and demand equilibrium, labor market wage/employment, AD-AS macro equilibrium, elasticity/revenue, and GDP or circular-flow relationships. Each graph question should clearly state the axes, curve(s), and the economic interpretation. Do not write a batch where every graph is just a demand curve or every question is a PPF. Force variation by concept and by graph shape.
+
+For each graph-type question, describe the visual setup in a realistic way: axes, curves, movement, equilibrium point, or shifts. Make each graph correspond to a different textbook concept from the course material.
+"""
+    elif question_style == "table_heavy":
+        style_block = """This batch is data-heavy. Make a visible share of questions use tables, schedules, or numeric scenarios. Use genuine economics data structures: a total-cost schedule for TFC/TVC/AVC/MC; demand and supply schedules for equilibrium or surplus/shortage; elasticity or total-revenue comparisons; GDP expenditure components; inflation/unemployment time series; or comparative-advantage production tables. The question should require students to inspect, compare, or calculate from the displayed values. Do not invent a table when a verbal question is clearer.
+"""
+    else:
+        style_block = """Vary the question formats across the batch. Use a mix of numerical calculation, policy/trade-off analysis, graph or curve interpretation, market equilibrium or elasticity comparison, and if-then scenarios using table or chart data. Do not make the whole batch only short conceptual questions or only repeated verbal scenarios.
+
+For graph/chart-based questions, explicitly describe the graph or table in the question text, including the relevant axes, shifts, equilibrium change, or data comparison. Rotate among PPF, supply-demand, labor market, AD-AS, elasticity/revenue, and GDP-style charts rather than repeating one figure pattern.
+"""
+    return f"""You are an economics professor and assessment designer for an accelerated MBA/ABE beginning-economics course.
 
 Create {quantity} brand-new multiple-choice question(s) based ONLY on the course material below. Mimic its style, difficulty, vocabulary, topic distribution, and solution depth. Do not copy wording or simply reproduce a question. Change the scenario, values, or framing while testing the same economic principles. The requested difficulty is {difficulty}.
 
-Return only valid JSON matching the supplied schema. Return an array with exactly {question_count} objects. Each object's options must be exactly four strings beginning with A), B), C), and D). correct_answer must be one letter. Make each explanation step-by-step and include formulas or calculations where relevant. Before returning, independently solve every question and check that the marked answer, numerical values, and explanation agree. Make the questions distinct from one another. source_reference should briefly name the concept or pattern from the source material that this new question mirrors.
+{style_block}
+
+Make the questions distinct from one another. Rotate among core beginning-econ topics: scarcity, opportunity cost, PPF, comparative advantage, supply and demand, elasticity, consumer surplus, production costs, labor market, unemployment, GDP, inflation, real vs nominal, AD-AS, fiscal policy, and monetary policy. Use realistic MBA-style business applications where relevant, but keep the concepts at the introductory level. Avoid reusing the same exact scenario pattern, graph family, data-table family, or wording structure more than once. Each question must feel fresh, not templated.
+
+Return only valid JSON matching the supplied schema. Return an array with exactly {question_count} objects. Each object's options must be exactly four strings beginning with A), B), C), and D). correct_answer must be one letter. Make each explanation step-by-step and include formulas or calculations where relevant. Before returning, independently solve every question and check that the marked answer, numerical values, and explanation agree.
+
+When a question depends on a schedule, dataset, cost table, demand/supply schedule, GDP-component breakdown, or other values students must inspect, include a data_table object with a short title, concise column headers, and rows of string values. Keep the question prose focused on the task; do not repeat the full table in prose. Do not attach a data_table to a question that does not require one.
+
+Every question must include a learning object. objective names the single skill being practiced. hint gives one productive next step without revealing the answer letter or final result. worked_steps contains 2 to 4 short, ordered reasoning steps that lead to the answer. misconception explains why a tempting wrong approach fails. The learning material must be specific to the actual values, graph, or causal mechanism in that question, never generic study advice.
+
+source_reference should briefly name the concept or pattern from the source material that this new question mirrors.
 
 COURSE MATERIAL:
 {limited_context}
@@ -520,7 +739,11 @@ COURSE MATERIAL:
 
 
 def generate_questions(
-    context_text: str, difficulty: str, api_key: str, question_count: int
+    context_text: str,
+    difficulty: str,
+    api_key: str,
+    question_count: int,
+    question_style: str = "mixed",
 ) -> list[dict[str, Any]]:
     if not context_text.strip():
         raise ValueError("Upload at least one course PDF or DOCX before generating questions.")
@@ -531,7 +754,7 @@ def generate_questions(
     client = genai.Client(api_key=api_key.strip())
     response = client.models.generate_content(
         model="gemini-3.6-flash",
-        contents=build_prompt(context_text, difficulty, question_count),
+        contents=build_prompt(context_text, difficulty, question_count, question_style),
         config={
             "response_mime_type": "application/json",
             "response_schema": {
@@ -554,6 +777,14 @@ def generate_questions(
         for question in questions
     ):
         raise ValueError("Gemini returned an invalid option set. Please try again.")
+    fingerprints = [_question_fingerprint(question) for question in questions]
+    if len(fingerprints) != len(set(fingerprints)):
+        raise ValueError("Gemini returned duplicate questions in the same batch. Please try again.")
+    quality_issues = [
+        issue for question in questions for issue in question_quality_issues(question)
+    ]
+    if quality_issues:
+        raise ValueError(f"Gemini returned a low-quality question batch: {quality_issues[0]}.")
     return audit_questions(difficulty, api_key, questions)
 
 
@@ -565,6 +796,8 @@ def audit_questions(
     audit_prompt = f"""You are the answer-key reviewer for an economics exam.
 
 Independently solve every question in the candidate batch below. Check all arithmetic, economic definitions, graph or curve logic, the marked correct answer, and whether the explanation actually supports it. Use ONLY the course material as the style and topic reference. Return exactly one final object per candidate in the same order. Preserve a sound question, but correct any wrong option, answer letter, calculation, or explanation you find. Do not mention this review process in the returned fields. The difficulty is {difficulty}.
+
+Also enforce diversity: do not keep multiple questions that are near-duplicates of one another. Reject repetitive verbal patterns, repeated graph setups, and repeated table-only questions. Prefer a mix of graph interpretation, data comparison, policy reasoning, and calculation. Every final question should still be valid, but the set should feel varied and fresh. Require a specific learning object: one measurable objective, a non-revealing hint, 2 to 4 correct worked steps, and a misconception correction tied to a plausible distractor.
 
 Return only a JSON array matching the supplied question schema.
 
@@ -590,6 +823,9 @@ CANDIDATE QUESTIONS:
             or question.get("correct_answer") not in {"A", "B", "C", "D"}
         ):
             raise ValueError("The answer review returned an invalid question. Please try again.")
+        quality_issues = question_quality_issues(question)
+        if quality_issues:
+            raise ValueError(f"The answer review returned a low-quality question: {quality_issues[0]}.")
         question["verified"] = True
     return audited
 
@@ -858,9 +1094,17 @@ def record_result(question: dict[str, Any], selected: str | None, mode: str) -> 
     st.session_state.recorded_attempt_questions.add(question_key)
 
 
+def next_question_style() -> str:
+    styles = ["mixed", "graph_heavy", "table_heavy"]
+    index = st.session_state.get("question_style_cycle_index", 0) % len(styles)
+    style = styles[index]
+    st.session_state.question_style_cycle_index = (index + 1) % len(styles)
+    return style
+
+
 def question_pool_signature() -> str:
     return hashlib.sha256(
-        f"{st.session_state.course_context}\n{st.session_state.difficulty}".encode()
+        f"question-bank-v2\n{st.session_state.course_context}\n{st.session_state.difficulty}".encode()
     ).hexdigest()
 
 
@@ -869,6 +1113,10 @@ def fill_question_pool(api_key: str, minimum: int = QUESTION_POOL_TARGET) -> Non
     if st.session_state.question_pool_signature != signature:
         st.session_state.question_pool = []
         st.session_state.served_question_ids = set()
+        st.session_state.recent_question_fingerprints = []
+        st.session_state.recent_topic_tags = []
+        st.session_state.recent_concept_families = []
+        st.session_state.recent_graph_families = []
         st.session_state.question_pool_signature = signature
     missing = minimum - len(st.session_state.question_pool)
     if missing <= 0:
@@ -881,22 +1129,30 @@ def fill_question_pool(api_key: str, minimum: int = QUESTION_POOL_TARGET) -> Non
         question for question in saved_questions
         if question.get("bank_id") not in saved_question_ids
     ]
-    st.session_state.question_pool.extend(reusable_questions[:missing])
+    st.session_state.question_pool.extend(order_question_pool(reusable_questions)[:missing])
     missing = minimum - len(st.session_state.question_pool)
     if missing <= 0:
+        st.session_state.question_pool = order_question_pool(st.session_state.question_pool)
         return
     with st.spinner(f"Creating and checking {missing} new questions for your bank..."):
+        question_style = st.session_state.question_style
+        if question_style == "auto":
+            question_style = next_question_style()
+        elif question_style == "mixed" and len(st.session_state.question_pool) % 2 == 0:
+            question_style = "graph_heavy"
         generated_questions = generate_questions(
             st.session_state.course_context,
             st.session_state.difficulty,
             api_key,
             missing,
+            question_style=question_style,
         )
         st.session_state.question_pool.extend(save_questions_to_bank(
             signature,
             st.session_state.difficulty,
             generated_questions,
         ))
+    st.session_state.question_pool = order_question_pool(st.session_state.question_pool)
 
 
 def take_pooled_question(api_key: str) -> dict[str, Any]:
@@ -906,6 +1162,7 @@ def take_pooled_question(api_key: str) -> dict[str, Any]:
         fill_question_pool(api_key, minimum=QUESTION_POOL_TARGET)
     question = st.session_state.question_pool.pop(0)
     mark_question_served(question)
+    _note_question_seen(question)
     st.session_state.active_question = question
     st.session_state.practice_answer = None
     st.session_state.practice_revealed = False
@@ -947,17 +1204,45 @@ def render_sidebar() -> tuple[str, str]:
             ingest_uploads(uploaded_files)
         elif st.session_state.document_names:
             st.caption(f"{len(st.session_state.document_names)} document(s) indexed")
+        cache_summary = get_document_cache_summary()
+        st.session_state.document_cache_summary = cache_summary
+        if cache_summary["cached_files"]:
+            st.caption(
+                f"Cached extracts: {cache_summary['cached_files']} files · "
+                f"{cache_summary['total_bytes'] / 1024:.1f} KB"
+            )
+            if st.button("Clear cache", key="clear_document_cache_button"):
+                clear_document_cache()
+                st.rerun()
+        elif st.button("Refresh cache", key="refresh_document_cache_button"):
+            st.session_state.document_cache_summary = get_document_cache_summary()
+            st.rerun()
         if st.session_state.rag_errors:
             st.warning("\n".join(st.session_state.rag_errors))
         st.divider()
+        workspace_options = ["Practice", "Learning", "Exam", "Market Shock", "Analytics"]
         mode = st.radio(
-            "Workspace", ["Practice", "Exam", "Market Shock", "Analytics"],
-            index=["Practice", "Exam", "Market Shock", "Analytics"].index(st.session_state.active_mode),
+            "Workspace", workspace_options,
+            index=workspace_options.index(st.session_state.active_mode) if st.session_state.active_mode in workspace_options else 0,
         )
         st.session_state.active_mode = mode
         st.session_state.difficulty = st.select_slider(
             "Question difficulty", options=["Foundational", "Intermediate", "Challenging"],
             value=st.session_state.difficulty,
+        )
+        style_options = ["auto", "mixed", "graph_heavy", "table_heavy"]
+        style_labels = {
+            "auto": "Auto rotation",
+            "mixed": "Mixed",
+            "graph_heavy": "Graph-heavy",
+            "table_heavy": "Table-heavy",
+        }
+        current_style = st.session_state.question_style if st.session_state.question_style in style_options else "auto"
+        st.session_state.question_style = st.selectbox(
+            "Question style",
+            style_options,
+            index=style_options.index(current_style),
+            format_func=lambda value: style_labels.get(value, value),
         )
         if st.session_state.question_pool:
             st.caption(f"Question bank: {len(st.session_state.question_pool)} verified and ready")
@@ -987,11 +1272,367 @@ def render_header(mode: str) -> None:
     )
 
 
+def infer_graph_type(question_text: str) -> str:
+    lower_text = question_text.lower()
+    if "ppf" in lower_text or "production possibilities frontier" in lower_text or "opportunity cost" in lower_text:
+        return "ppf"
+    if any(token in lower_text for token in ("ad-as", "aggregate demand", "aggregate supply", "inflation", "output gap", "real gdp")):
+        return "ad_as"
+    if any(token in lower_text for token in ("wage", "employment", "labor market", "labor supply", "marginal revenue product", "unemployment")):
+        return "labor_market"
+    if any(token in lower_text for token in ("elasticity", "total revenue", "price elasticity", "demand curve", "consumer surplus")):
+        return "elasticity"
+    if any(token in lower_text for token in ("demand", "supply", "equilibrium", "price", "quantity")):
+        return "supply_demand"
+    if any(token in lower_text for token in ("gdp", "national income", "consumption", "investment", "exports", "imports")):
+        return "gdp"
+    return "generic"
+
+
+def build_ppf_plot(question_text: str) -> go.Figure | None:
+    coordinate_pairs = re.findall(
+        r"\(\s*(\d+(?:\.\d+)?)\s*(?:[A-Za-z][^,()]*)?,\s*(\d+(?:\.\d+)?)\s*(?:[A-Za-z][^,()]*)?\)",
+        question_text,
+    )
+    if len(coordinate_pairs) < 2:
+        coordinate_pairs = [(100, 80), (150, 50)]
+    xs = [float(x) for x, _ in coordinate_pairs]
+    ys = [float(y) for _, y in coordinate_pairs]
+    x_max = max(xs) * 1.25 if xs else 200
+    y_max = max(ys) * 1.25 if ys else 120
+    curve_x = [0.0, x_max * 0.23, x_max * 0.52, x_max * 0.77, x_max]
+    curve_y = [y_max * 1.04, y_max * 0.78, y_max * 0.58, y_max * 0.3, 0.0]
+    labels = ["Point A", "Point B", "Point C", "Point D", "Point E"]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=curve_x,
+        y=curve_y,
+        mode="lines",
+        line=dict(color="#53c5bb", width=3),
+        name="PPF",
+    ))
+    for idx, (x, y) in enumerate(zip(xs[:5], ys[:5])):
+        fig.add_trace(go.Scatter(
+            x=[x],
+            y=[y],
+            mode="markers+text",
+            text=[labels[idx] if idx < len(labels) else f"P{idx + 1}"],
+            textposition="top center",
+            marker=dict(size=11, color="#ff8060"),
+            name=labels[idx] if idx < len(labels) else f"P{idx + 1}",
+            showlegend=False,
+        ))
+
+    x_axis_label = "Solar Panels" if "solar" in question_text.lower() else "Good X"
+    y_axis_label = "Wind Turbines" if "wind" in question_text.lower() else "Good Y"
+    fig.update_layout(
+        title="Production Possibilities Frontier",
+        xaxis_title=x_axis_label,
+        yaxis_title=y_axis_label,
+        template="plotly_dark",
+        margin=dict(l=45, r=20, t=45, b=45),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        height=360,
+    )
+    fig.update_xaxes(range=[0, x_max * 1.08], zeroline=False)
+    fig.update_yaxes(range=[0, y_max * 1.12], zeroline=False)
+    return fig
+
+
+def build_supply_demand_plot(question_text: str) -> go.Figure | None:
+    fig = go.Figure()
+    x_values = [0, 12, 24, 36, 48, 60]
+    if "inelastic" in question_text.lower() or "elastic" in question_text.lower():
+        demand_y = [48, 40, 33, 27, 22, 18]
+        supply_y = [10, 15, 22, 29, 36, 43]
+        title = "Elasticity and Market Equilibrium"
+    else:
+        demand_y = [52, 44, 35, 26, 18, 11]
+        supply_y = [10, 16, 22, 31, 39, 49]
+        title = "Supply and Demand"
+    fig.add_trace(go.Scatter(x=x_values, y=demand_y, mode="lines", name="Demand", line=dict(color="#ff8060", width=3)))
+    fig.add_trace(go.Scatter(x=x_values, y=supply_y, mode="lines", name="Supply", line=dict(color="#53c5bb", width=3)))
+    fig.add_trace(go.Scatter(x=[30], y=[26], mode="markers+text", text=["Equilibrium"], textposition="top center", name="Equilibrium", marker=dict(size=10, color="#f4c95d"), showlegend=False))
+    fig.update_layout(
+        title=title,
+        xaxis_title="Quantity",
+        yaxis_title="Price",
+        template="plotly_dark",
+        margin=dict(l=45, r=20, t=45, b=45),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        height=360,
+    )
+    return fig
+
+
+def build_labor_market_plot(question_text: str) -> go.Figure | None:
+    fig = go.Figure()
+    x_values = [0, 20, 40, 60, 80, 100]
+    labor_demand = [95, 80, 65, 50, 35, 20]
+    labor_supply = [10, 25, 40, 55, 70, 90]
+    fig.add_trace(go.Scatter(x=x_values, y=labor_demand, mode="lines", name="Labor demand", line=dict(color="#ff8060", width=3)))
+    fig.add_trace(go.Scatter(x=x_values, y=labor_supply, mode="lines", name="Labor supply", line=dict(color="#53c5bb", width=3)))
+    fig.add_trace(go.Scatter(x=[52], y=[50], mode="markers+text", text=["Equilibrium wage"], textposition="top center", name="Equilibrium", marker=dict(size=10, color="#f4c95d"), showlegend=False))
+    fig.update_layout(
+        title="Labor Market",
+        xaxis_title="Employment / Labor",
+        yaxis_title="Wage",
+        template="plotly_dark",
+        margin=dict(l=45, r=20, t=45, b=45),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        height=360,
+    )
+    return fig
+
+
+def build_ad_as_plot(question_text: str) -> go.Figure | None:
+    fig = go.Figure()
+    real_output = [0, 25, 50, 75, 100]
+    ad = [95, 90, 85, 80, 75]
+    sras = [60, 70, 80, 90, 100]
+    lras = [75, 75, 75, 75, 75]
+    fig.add_trace(go.Scatter(x=real_output, y=ad, mode="lines", name="AD", line=dict(color="#ff8060", width=3)))
+    fig.add_trace(go.Scatter(x=real_output, y=sras, mode="lines", name="SRAS", line=dict(color="#53c5bb", width=3)))
+    fig.add_trace(go.Scatter(x=real_output, y=lras, mode="lines", name="LRAS", line=dict(color="#f4c95d", width=3, dash="dash")))
+    fig.add_trace(go.Scatter(x=[75], y=[75], mode="markers+text", text=["Macro equilibrium"], textposition="top center", name="Equilibrium", marker=dict(size=10, color="#9cc7ff"), showlegend=False))
+    fig.update_layout(
+        title="AD-AS Model",
+        xaxis_title="Real GDP",
+        yaxis_title="Price Level",
+        template="plotly_dark",
+        margin=dict(l=45, r=20, t=45, b=45),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        height=360,
+    )
+    return fig
+
+
+def build_elasticity_plot(question_text: str) -> go.Figure | None:
+    fig = go.Figure()
+    price = [0, 2, 4, 6, 8, 10]
+    quantity = [14, 12, 9, 7, 5, 2]
+    fig.add_trace(go.Scatter(x=price, y=quantity, mode="lines", name="Demand", line=dict(color="#ff8060", width=3)))
+    fig.add_trace(go.Scatter(x=[6], y=[7], mode="markers+text", text=["Elasticity point"], textposition="top center", marker=dict(size=10, color="#f4c95d"), showlegend=False))
+    fig.update_layout(
+        title="Elasticity of Demand",
+        xaxis_title="Price",
+        yaxis_title="Quantity Demanded",
+        template="plotly_dark",
+        margin=dict(l=45, r=20, t=45, b=45),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        height=360,
+    )
+    return fig
+
+
+def build_gdp_plot(question_text: str) -> go.Figure | None:
+    categories = ["Consumption", "Investment", "Government", "Net Exports"]
+    values = [55, 20, 18, 7]
+    fig = go.Figure(data=[go.Bar(x=categories, y=values, marker_color=["#ff8060", "#53c5bb", "#f4c95d", "#9cc7ff"])])
+    fig.update_layout(
+        title="GDP Expenditure Components",
+        xaxis_title="Component",
+        yaxis_title="Share of GDP (%)",
+        template="plotly_dark",
+        margin=dict(l=45, r=20, t=45, b=45),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        height=360,
+    )
+    return fig
+
+
+def generate_question_plot(question: dict[str, Any]) -> go.Figure | None:
+    question_text = question.get("question", "")
+    graph_type = infer_graph_type(question_text)
+    if graph_type == "ppf":
+        return build_ppf_plot(question_text)
+    if graph_type == "ad_as":
+        return build_ad_as_plot(question_text)
+    if graph_type == "labor_market":
+        return build_labor_market_plot(question_text)
+    if graph_type == "elasticity":
+        return build_elasticity_plot(question_text)
+    if graph_type == "supply_demand":
+        return build_supply_demand_plot(question_text)
+    if graph_type == "gdp":
+        return build_gdp_plot(question_text)
+    return None
+
+
+def normalized_question_table(question: dict[str, Any]) -> tuple[str, list[str], list[list[str]]] | None:
+    data_table = question.get("data_table")
+    if isinstance(data_table, dict):
+        title = str(data_table.get("title", "Data table")).strip()
+        columns = data_table.get("columns")
+        rows = data_table.get("rows")
+        if (
+            isinstance(columns, list)
+            and len(columns) >= 2
+            and isinstance(rows, list)
+            and rows
+            and all(isinstance(row, list) and len(row) == len(columns) for row in rows)
+        ):
+            return title, [str(column) for column in columns], [
+                [str(value) for value in row] for row in rows
+            ]
+
+    question_text = question.get("question", "")
+    cost_language = ("total cost", "marginal cost", "average variable cost", "fixed cost")
+    if not any(phrase in question_text.lower() for phrase in cost_language):
+        return None
+    pairs = re.findall(
+        r"\bQ\s*=\s*(\d+(?:\.\d+)?)\s*(?:units?)?\s*,?\s*TC\s*=\s*\$?\s*(\d+(?:\.\d+)?)",
+        question_text,
+        flags=re.IGNORECASE,
+    )
+    if len(pairs) < 2:
+        return None
+    rows = [[quantity, f"${cost}"] for quantity, cost in pairs]
+    return "Total cost schedule", ["Output (Q)", "Total Cost (TC)"], rows
+
+
+def question_display_text(question: dict[str, Any]) -> str:
+    question_text = question.get("question", "")
+    if not normalized_question_table(question) or question.get("data_table"):
+        return question_text
+    return re.sub(
+        r"\s+where\s+.*?\bQ\s*=.*?(?=\s+(?:At\s+an\s+output|What\s+are|Which\s+of|Calculate)\b|$)",
+        "",
+        question_text,
+        flags=re.IGNORECASE,
+    )
+
+
+def learning_material(question: dict[str, Any]) -> dict[str, Any]:
+    supplied = question.get("learning")
+    if isinstance(supplied, dict) and all(supplied.get(key) for key in ("objective", "hint", "worked_steps", "misconception")):
+        return supplied
+    concept = question_concept_family(question).replace("_", " ")
+    table_data = normalized_question_table(question)
+    if table_data is not None:
+        title, columns, rows = table_data
+        return {
+            "objective": f"Read a {title.lower()} and identify the relevant economic measure.",
+            "hint": f"Start with the row or rows named in the question, then write the formula before substituting values from {columns[0]} and {columns[1]}.",
+            "worked_steps": [
+                "Identify the requested measure and the observations it requires.",
+                "Use the displayed schedule rather than treating every total as a per-unit value.",
+                question.get("explanation", "Check the correct option against the definition and arithmetic."),
+            ],
+            "misconception": "A common error is to use a total where the question requires a change, average, or fixed component. Match the formula to the measure first.",
+        }
+    return {
+        "objective": f"Apply the core logic of {concept} to a new scenario.",
+        "hint": "Name the economic relationship that changes first, then trace its consequence before comparing the answer choices.",
+        "worked_steps": [
+            "Identify the economic concept and the relevant change described in the scenario.",
+            "Eliminate options that reverse the direction of the relationship or ignore the stated condition.",
+            question.get("explanation", "Check the remaining option against the economic definition."),
+        ],
+        "misconception": "A tempting wrong answer often describes a related concept but reverses the causal direction or overlooks the question's stated assumption.",
+    }
+
+
+def question_quality_issues(question: dict[str, Any]) -> list[str]:
+    issues: list[str] = []
+    if len(question.get("question", "").strip()) < 40:
+        issues.append("question stem is too short")
+    if len(question.get("explanation", "").strip()) < 60:
+        issues.append("explanation is too brief")
+    data_table = question.get("data_table")
+    if data_table is not None and normalized_question_table({"data_table": data_table}) is None:
+        issues.append("data table is malformed")
+    learning = question.get("learning")
+    if learning is not None:
+        if not isinstance(learning, dict):
+            issues.append("learning material is malformed")
+        elif not all(str(learning.get(key, "")).strip() for key in ("objective", "hint", "misconception")):
+            issues.append("learning material is incomplete")
+        elif not isinstance(learning.get("worked_steps"), list) or not 2 <= len(learning["worked_steps"]) <= 4:
+            issues.append("worked steps must contain 2 to 4 items")
+    return issues
+
+
+def learning_priority(question: dict[str, Any]) -> tuple[int, int, int, int, str]:
+    concept = question_concept_family(question)
+    relevant_attempts = [
+        attempt for attempt in st.session_state.history
+        if (
+            question_concept_family({"topic_tag": attempt.get("topic", "")}) == concept
+            or attempt.get("topic", "").strip().lower() == question.get("topic_tag", "").strip().lower()
+        )
+    ]
+    missed = sum(not attempt["is_correct"] for attempt in relevant_attempts)
+    attempts = len(relevant_attempts)
+    recent_concepts = set(st.session_state.get("recent_concept_families", [])[-4:])
+    return (
+        0 if missed else 1,
+        -missed,
+        attempts,
+        1 if concept in recent_concepts else 0,
+        _question_fingerprint(question),
+    )
+
+
+def learning_focus_summary() -> tuple[str, int, int] | None:
+    attempts_by_concept: dict[str, list[dict[str, Any]]] = {}
+    for attempt in st.session_state.history:
+        concept = question_concept_family({"topic_tag": attempt.get("topic", "")})
+        attempts_by_concept.setdefault(concept, []).append(attempt)
+    candidates = [
+        (concept, attempts)
+        for concept, attempts in attempts_by_concept.items()
+        if attempts
+    ]
+    if not candidates:
+        return None
+    concept, attempts = min(
+        candidates,
+        key=lambda item: (sum(attempt["is_correct"] for attempt in item[1]) / len(item[1]), -len(item[1])),
+    )
+    correct = sum(attempt["is_correct"] for attempt in attempts)
+    return concept.replace("_", " ").title(), correct, len(attempts)
+
+
+def take_learning_question(api_key: str) -> dict[str, Any]:
+    if not st.session_state.question_pool or len(st.session_state.question_pool) <= QUESTION_POOL_REFILL_THRESHOLD:
+        fill_question_pool(api_key, minimum=QUESTION_POOL_TARGET)
+    question = min(st.session_state.question_pool, key=learning_priority)
+    st.session_state.question_pool.remove(question)
+    mark_question_served(question)
+    _note_question_seen(question)
+    st.session_state.learning_question = question
+    st.session_state.learning_answer = None
+    st.session_state.learning_revealed = False
+    st.session_state.learning_hint_visible = False
+    return question
+
+
+def render_question_visuals(question: dict[str, Any]) -> None:
+    table_data = normalized_question_table(question)
+    if table_data is not None:
+        title, columns, rows = table_data
+        st.caption(title)
+        st.dataframe(pd.DataFrame(rows, columns=columns), hide_index=True, use_container_width=True)
+    plot_figure = generate_question_plot(question)
+    if plot_figure is not None:
+        st.caption("Visual model")
+        st.plotly_chart(plot_figure, use_container_width=True)
+
+
 def render_question(question: dict[str, Any], api_key: str, mode: str) -> None:
     st.markdown('<div class="question-panel">', unsafe_allow_html=True)
     verification = " · VERIFIED" if question.get("verified") else ""
     st.markdown(f'<div class="question-number">QUESTION {len(st.session_state.history) + 1:02d} · {question.get("topic_tag", "ECONOMICS").upper()}{verification}</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="question-text">{question["question"]}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="question-text">{question_display_text(question)}</div>', unsafe_allow_html=True)
+    render_question_visuals(question)
     options = question.get("options", [])
     selected = st.radio("Choose an answer", options, key=f"answer_{id(question)}", label_visibility="collapsed")
     selected_letter = selected[:1] if selected else ""
@@ -1009,6 +1650,77 @@ def render_question(question: dict[str, Any], api_key: str, mode: str) -> None:
     else:
         st.session_state.exam_answers[st.session_state.exam_index] = selected_letter
     st.markdown('</div>', unsafe_allow_html=True)
+
+
+def render_learning(api_key: str) -> None:
+    st.markdown('<div class="section-label">Guided practice / retrieve, reason, correct</div>', unsafe_allow_html=True)
+    if not st.session_state.course_context:
+        st.info("Upload course material before starting a learning path. Learning mode will then prioritize concepts you miss.")
+        return
+    focus = learning_focus_summary()
+    if focus is None:
+        st.caption("First pass: the learning path will sample the course broadly, then adapt to your results.")
+    else:
+        concept, correct, attempts = focus
+        st.caption(f"Current review focus: {concept} ({correct} of {attempts} correct).")
+    if st.session_state.learning_question is None:
+        st.markdown("## Learning mode")
+        st.write("Work one verified question at a time. Ask for a hint before committing, then use the worked solution to correct the exact misconception behind a miss.")
+        if st.button("Start a learning card", type="primary"):
+            try:
+                take_learning_question(api_key)
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+        return
+
+    question = st.session_state.learning_question
+    material = learning_material(question)
+    st.markdown('<div class="question-panel">', unsafe_allow_html=True)
+    st.markdown(f'<div class="question-number">LEARNING CARD · {question.get("topic_tag", "ECONOMICS").upper()}</div>', unsafe_allow_html=True)
+    st.caption(f"Skill: {material['objective']}")
+    st.markdown(f'<div class="question-text">{question_display_text(question)}</div>', unsafe_allow_html=True)
+    render_question_visuals(question)
+    if not st.session_state.learning_revealed and not st.session_state.learning_hint_visible:
+        if st.button("Show a hint", key=f"hint_{id(question)}"):
+            st.session_state.learning_hint_visible = True
+            st.rerun()
+    if st.session_state.learning_hint_visible and not st.session_state.learning_revealed:
+        st.info(material["hint"])
+    selected = st.radio("Choose an answer", question.get("options", []), key=f"learning_answer_{id(question)}", label_visibility="collapsed")
+    selected_letter = selected[:1] if selected else ""
+    if not st.session_state.learning_revealed:
+        if st.button("Check my reasoning", type="primary", key=f"learning_check_{id(question)}"):
+            st.session_state.learning_answer = selected_letter
+            st.session_state.learning_revealed = True
+            record_result(question, selected_letter, "Learning")
+            st.rerun()
+    else:
+        is_correct = st.session_state.learning_answer == question["correct_answer"]
+        if is_correct:
+            st.success("Correct. Now connect the answer to its underlying rule.")
+        else:
+            st.error(
+                f"The correct answer is {question['correct_answer']}. "
+                "Use the reasoning below to repair the model, not just memorize the letter."
+            )
+        st.markdown("#### Worked reasoning")
+        for step_number, step in enumerate(material["worked_steps"], start=1):
+            st.markdown(f"{step_number}. {step}")
+        st.markdown(f'<div class="explanation"><strong>Watch for this</strong><br>{material["misconception"]}</div>', unsafe_allow_html=True)
+        st.markdown(f'<p class="small-mono">MIMICS: {question.get("source_reference", "Course material")}</p>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+    if st.session_state.learning_revealed and st.button("Next learning card", type="primary"):
+        try:
+            take_learning_question(api_key)
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+    if st.session_state.learning_revealed and st.button("Retry this question"):
+        st.session_state.learning_answer = None
+        st.session_state.learning_revealed = False
+        st.session_state.learning_hint_visible = True
+        st.rerun()
 
 
 def render_practice(api_key: str) -> None:
@@ -1287,6 +1999,8 @@ def main() -> None:
     render_header(mode)
     if mode == "Practice":
         render_practice(api_key)
+    elif mode == "Learning":
+        render_learning(api_key)
     elif mode == "Exam":
         render_exam(api_key)
     elif mode == "Market Shock":
