@@ -33,6 +33,8 @@ GEMINI_API_KEY=your_key_here
 
 The app loads this with `python-dotenv`. The key is never displayed, stored in the course context, or entered by end users.
 
+The bundled `rag_data/ABE Accelerated Economics Reference.md` provides a compact concept map for the accelerated ABE/MBA sequence: scarcity, PPFs, trade, supply and demand, elasticity, production costs, labor markets, GDP, inflation, aggregate demand/supply, policy, and market structures. Uploaded exams and solutions remain the primary style source. Gemini receives the full compact reference plus balanced excerpts from every other source, rather than only the first part of the first long PDF.
+
 For Streamlit Community Cloud or another hosted deployment, do not deploy `.env`. Add this under the app's **Secrets** settings instead:
 
 ```toml

@@ -126,6 +126,16 @@ QUESTION_SCHEMA = {
             },
             "required": ["objective", "hint", "worked_steps", "misconception"],
         },
+        "assessment": {
+            "type": "object",
+            "properties": {
+                "cognitive_skill": {"type": "string"},
+                "scenario_type": {"type": "string"},
+                "distractor_logic": {"type": "array", "items": {"type": "string"}},
+                "answer_check": {"type": "string"},
+            },
+            "required": ["cognitive_skill", "scenario_type", "distractor_logic", "answer_check"],
+        },
     },
     "required": [
         "question", "options", "correct_answer", "topic_tag",
@@ -144,6 +154,18 @@ DEMO_QUESTION = {
 
 QUESTION_POOL_TARGET = 12
 QUESTION_POOL_REFILL_THRESHOLD = 4
+CORE_CONCEPT_FAMILIES = [
+    "scarcity_ppf",
+    "trade",
+    "supply_demand",
+    "elasticity",
+    "production_costs",
+    "labor",
+    "gdp_growth",
+    "inflation",
+    "macro_policy",
+    "market_structure",
+]
 GAME_ROUNDS = 10
 GAME_STARTING_INDICATORS = {
     "growth": 60,
@@ -202,6 +224,9 @@ def init_state() -> None:
         "learning_answer": None,
         "learning_revealed": False,
         "learning_hint_visible": False,
+        "learning_confidence": "Not sure yet",
+        "learning_reflection": "",
+        "learning_reflection_saved": False,
         "difficulty": "Intermediate",
         "question_loading": False,
         "question_pool": [],
@@ -213,6 +238,7 @@ def init_state() -> None:
         "recent_graph_families": [],
         "question_style": "auto",
         "question_style_cycle_index": 0,
+        "concept_cycle_index": 0,
         "document_cache_summary": {"cached_files": 0, "total_bytes": 0},
         "game_active": False,
         "game_track": "Mixed Final",
@@ -343,7 +369,7 @@ def load_history() -> None:
         rows = connection.execute(text("""
             SELECT created_at, mode, topic, difficulty, question,
                    selected, correct, is_correct, verified
-            FROM attempts ORDER BY id
+            FROM attempts ORDER BY created_at ASC, id ASC
         """)).mappings().all()
     st.session_state.history = [
         {
@@ -387,7 +413,7 @@ def question_concept_family(question: dict[str, Any]) -> str:
         "trade": ("comparative advantage", "absolute advantage", "tariff", "trade"),
         "supply_demand": ("supply", "demand", "equilibrium", "consumer surplus", "price ceiling", "price floor"),
         "elasticity": ("elasticity", "total revenue", "tax incidence"),
-        "production_costs": ("total cost", "fixed cost", "variable cost", "marginal cost", "average cost", "cost curve"),
+        "production_costs": ("production cost", "total cost", "fixed cost", "variable cost", "marginal cost", "average cost", "cost curve"),
         "labor": ("labor", "labour", "wage", "employment", "unemployment", "marginal revenue product"),
         "gdp_growth": ("gdp", "gross domestic", "real vs", "nominal", "economic growth"),
         "inflation": ("inflation", "cpi", "deflator", "price level"),
@@ -405,17 +431,66 @@ def question_graph_family(question: dict[str, Any]) -> str:
     return graph_type if graph_type != "generic" else "nonvisual"
 
 
+def question_presentation_family(question: dict[str, Any]) -> str:
+    if normalized_question_table(question) is not None:
+        return "table"
+    graph_type = question_graph_family(question)
+    return f"graph:{graph_type}" if graph_type != "nonvisual" else "nonvisual"
+
+
+def next_generation_concepts(question_count: int) -> list[str]:
+    index = st.session_state.get("concept_cycle_index", 0) % len(CORE_CONCEPT_FAMILIES)
+    concepts = [
+        CORE_CONCEPT_FAMILIES[(index + offset) % len(CORE_CONCEPT_FAMILIES)]
+        for offset in range(question_count)
+    ]
+    st.session_state.concept_cycle_index = (index + question_count) % len(CORE_CONCEPT_FAMILIES)
+    return concepts
+
+
+def question_batch_diversity_issues(
+    questions: list[dict[str, Any]], question_style: str, required_concepts: list[str] | None = None
+) -> list[str]:
+    if len(questions) < 2:
+        return []
+    concepts = [question_concept_family(question) for question in questions]
+    presentations = [question_presentation_family(question) for question in questions]
+    minimum_concepts = min(len(questions), 4)
+    if required_concepts:
+        missing_concepts = set(required_concepts) - set(concepts)
+        if missing_concepts:
+            return [f"batch omitted required concept: {sorted(missing_concepts)[0]}"]
+    if len(set(concepts)) < minimum_concepts:
+        return [f"batch covers only {len(set(concepts))} concept families; expected {minimum_concepts}"]
+    if max(concepts.count(concept) for concept in set(concepts)) > (len(questions) + 1) // 2:
+        return ["one concept family dominates the batch"]
+    if question_style == "mixed" and len(questions) >= 3 and len(set(presentations)) < 2:
+        return ["mixed batch lacks presentation variety"]
+    if question_style == "graph_heavy":
+        graph_families = [presentation for presentation in presentations if presentation.startswith("graph:")]
+        minimum_graphs = (len(questions) * 3 + 4) // 5
+        if len(graph_families) < minimum_graphs:
+            return ["graph-heavy batch contains too few graph questions"]
+        if len(graph_families) >= 2 and len(set(graph_families)) < 2:
+            return ["graph-heavy batch repeats one graph family"]
+    if question_style == "table_heavy":
+        table_count = presentations.count("table")
+        if table_count < (len(questions) + 1) // 2:
+            return ["table-heavy batch contains too few data tables"]
+    return []
+
+
 def _question_diversity_sort_key(question: dict[str, Any]) -> tuple[int, int, int, int, int, str]:
     recent_hashes = set(st.session_state.get("recent_question_fingerprints", [])[-8:])
     recent_topics = set(st.session_state.get("recent_topic_tags", [])[-3:])
     recent_concepts = set(st.session_state.get("recent_concept_families", [])[-4:])
-    recent_graphs = set(st.session_state.get("recent_graph_families", [])[-3:])
+    recent_presentations = set(st.session_state.get("recent_graph_families", [])[-3:])
     topic = question.get("topic_tag", "General economics")
     return (
         1 if _question_fingerprint(question) in recent_hashes else 0,
         1 if topic in recent_topics else 0,
         1 if question_concept_family(question) in recent_concepts else 0,
-        1 if question_graph_family(question) in recent_graphs else 0,
+        1 if question_presentation_family(question) in recent_presentations else 0,
         int(question.get("times_served", 0)),
         hashlib.sha256((question.get("bank_id") or question.get("question", "")).encode()).hexdigest(),
     )
@@ -427,17 +502,18 @@ def order_question_pool(questions: list[dict[str, Any]]) -> list[dict[str, Any]]
     ordered: list[dict[str, Any]] = []
     selected_topics: set[str] = set()
     selected_concepts: set[str] = set()
-    selected_graphs: set[str] = set()
+    selected_presentations: set[str] = set()
     while remaining:
         def pool_key(question: dict[str, Any]) -> tuple[int, int, int, int, int, int, str]:
             base_key = _question_diversity_sort_key(question)
             topic = question.get("topic_tag", "General economics")
             concept = question_concept_family(question)
-            graph = question_graph_family(question)
+            presentation = question_presentation_family(question)
             return (
                 base_key[0], base_key[1], base_key[2], base_key[3],
                 1 if topic in selected_topics else 0,
-                1 if concept in selected_concepts or graph in selected_graphs else 0,
+                1 if concept in selected_concepts else 0,
+                1 if presentation in selected_presentations else 0,
                 base_key[5],
             )
         next_question = min(remaining, key=pool_key)
@@ -445,8 +521,24 @@ def order_question_pool(questions: list[dict[str, Any]]) -> list[dict[str, Any]]
         ordered.append(next_question)
         selected_topics.add(next_question.get("topic_tag", "General economics"))
         selected_concepts.add(question_concept_family(next_question))
-        selected_graphs.add(question_graph_family(next_question))
+        selected_presentations.add(question_presentation_family(next_question))
     return ordered
+
+
+def select_balanced_pool(questions: list[dict[str, Any]], target_size: int) -> list[dict[str, Any]]:
+    """Limit any one concept so legacy bank clusters cannot monopolize a new pool."""
+    selected: list[dict[str, Any]] = []
+    concept_counts: dict[str, int] = {}
+    concept_limit = max(1, (target_size + 5) // 6)
+    for question in order_question_pool(questions):
+        concept = question_concept_family(question)
+        if concept_counts.get(concept, 0) >= concept_limit:
+            continue
+        selected.append(question)
+        concept_counts[concept] = concept_counts.get(concept, 0) + 1
+        if len(selected) == target_size:
+            break
+    return selected
 
 
 def _note_question_seen(question: dict[str, Any]) -> None:
@@ -467,10 +559,37 @@ def _note_question_seen(question: dict[str, Any]) -> None:
         recent_concepts = recent_concepts[-4:]
     st.session_state.recent_concept_families = recent_concepts
     recent_graphs = st.session_state.get("recent_graph_families", [])
-    recent_graphs.append(question_graph_family(question))
+    recent_graphs.append(question_presentation_family(question))
     if len(recent_graphs) > 3:
         recent_graphs = recent_graphs[-3:]
     st.session_state.recent_graph_families = recent_graphs
+
+
+def _question_is_repeat_of_last(question: dict[str, Any]) -> bool:
+    recent_concepts = st.session_state.get("recent_concept_families", [])
+    recent_presentations = st.session_state.get("recent_graph_families", [])
+    if not recent_concepts and not recent_presentations:
+        return False
+    return (
+        bool(recent_concepts)
+        and question_concept_family(question) == recent_concepts[-1]
+    ) or (
+        bool(recent_presentations)
+        and question_presentation_family(question) == recent_presentations[-1]
+    )
+
+
+def _next_diverse_pool_question(
+    questions: list[dict[str, Any]],
+    priority: Any | None = None,
+) -> dict[str, Any]:
+    if not questions:
+        raise ValueError("No questions are available in the pool.")
+    alternatives = [question for question in questions if not _question_is_repeat_of_last(question)]
+    candidates = alternatives or questions
+    if priority is None:
+        return candidates[0]
+    return min(candidates, key=priority)
 
 
 def load_saved_questions(context_signature: str, difficulty: str) -> list[dict[str, Any]]:
@@ -498,7 +617,12 @@ def load_saved_questions(context_signature: str, difficulty: str) -> list[dict[s
     for row in rows:
         if row["id"] in st.session_state.served_question_ids:
             continue
-        question = json.loads(row["question_json"])
+        try:
+            question = json.loads(row["question_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(question, dict):
+            continue
         question["bank_id"] = row["id"]
         question["times_served"] = int(row["times_served"])
         saved_questions.append(question)
@@ -555,8 +679,10 @@ def render_login() -> None:
         '<h1>Welcome back.</h1><p>Enter the study-room password to continue.</p></div>',
         unsafe_allow_html=True,
     )
-    password = st.text_input("Password", type="password")
-    if st.button("Enter study room", type="primary"):
+    with st.form("login_form", clear_on_submit=False):
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Enter study room", type="primary")
+    if submitted:
         if hmac.compare_digest(password, configured_password):
             st.session_state.authenticated = True
             st.rerun()
@@ -566,6 +692,8 @@ def render_login() -> None:
 def extract_text(file_name: str, file_bytes: bytes) -> str:
     """Extract readable text from an uploaded PDF or DOCX."""
     suffix = file_name.lower().rsplit(".", 1)[-1]
+    if suffix in {"md", "txt"}:
+        return file_bytes.decode("utf-8", errors="replace")
     if suffix == "pdf":
         if PdfReader is None:
             raise RuntimeError("PyPDF2 is not installed.")
@@ -638,7 +766,7 @@ def load_rag_folder() -> None:
     names: list[str] = []
     errors: list[str] = []
     for source_path in sorted(RAG_DATA_DIR.iterdir()):
-        if not source_path.is_file() or source_path.suffix.lower() not in {".pdf", ".docx"}:
+        if not source_path.is_file() or source_path.suffix.lower() not in {".pdf", ".docx", ".md", ".txt"}:
             continue
         try:
             raw_bytes = source_path.read_bytes()
@@ -696,13 +824,59 @@ def ingest_uploads(uploaded_files: list[Any]) -> None:
         st.sidebar.success(f"Indexed {len(texts)} document(s)")
 
 
+def prompt_context_excerpt(context_text: str, max_chars: int = 120000) -> str:
+    """Keep the compact reference plus representative head/tail excerpts from every source."""
+    if len(context_text) <= max_chars:
+        return context_text
+    sections = [section.strip() for section in context_text.split("\n\n---\n\n") if section.strip()]
+    if not sections:
+        return context_text[:max_chars]
+    reference_sections = [
+        section for section in sections
+        if "Accelerated Economics Reference" in section or "SOURCE FILE: ABE Accelerated" in section
+    ]
+    other_sections = [section for section in sections if section not in reference_sections]
+    separator = "\n\n---\n\n"
+    section_count = len(reference_sections) + len(other_sections)
+    separator_budget = len(separator) * max(0, section_count - 1)
+    available_budget = max(0, max_chars - separator_budget)
+    reference_budget = min(
+        sum(len(section) for section in reference_sections),
+        available_budget // 4,
+    )
+    remaining_budget = available_budget - reference_budget
+    selected: list[str] = []
+    if reference_sections:
+        reference_text = "\n\n---\n\n".join(reference_sections)
+        selected.append(reference_text[:reference_budget])
+    if other_sections and remaining_budget > 0:
+        per_source = max(1, remaining_budget // len(other_sections))
+        for section in other_sections:
+            if len(section) <= per_source:
+                selected.append(section)
+                continue
+            omission_marker = "\n... [middle of source excerpt omitted] ...\n"
+            content_budget = max(1, per_source - len(omission_marker))
+            head_budget = max(1, content_budget * 2 // 3)
+            tail_budget = max(1, content_budget - head_budget)
+            selected.append(
+                section[:head_budget]
+                + omission_marker
+                + section[-tail_budget:]
+            )
+    excerpt = separator.join(selected)
+    return excerpt[:max_chars]
+
+
 def build_prompt(
     context_text: str,
     difficulty: str,
     question_count: int = 1,
     question_style: str = "mixed",
+    required_concepts: list[str] | None = None,
+    repair_feedback: str = "",
 ) -> str:
-    limited_context = context_text[:120000]
+    limited_context = prompt_context_excerpt(context_text)
     quantity = "one" if question_count == 1 else f"exactly {question_count}"
     if question_style == "graph_heavy":
         style_block = """This batch is graph-heavy. Make at least 60% of the questions explicitly about graphs, curves, or charts. The graph topics must be diversified across the core beginning-economics sequence used in accelerated MBA/ABE courses, not all the same kind of chart. Use a rotating mix of these graph families: PPF/opportunity cost, supply and demand equilibrium, labor market wage/employment, AD-AS macro equilibrium, elasticity/revenue, and GDP or circular-flow relationships. Each graph question should clearly state the axes, curve(s), and the economic interpretation. Do not write a batch where every graph is just a demand curve or every question is a PPF. Force variation by concept and by graph shape.
@@ -717,11 +891,26 @@ For each graph-type question, describe the visual setup in a realistic way: axes
 
 For graph/chart-based questions, explicitly describe the graph or table in the question text, including the relevant axes, shifts, equilibrium change, or data comparison. Rotate among PPF, supply-demand, labor market, AD-AS, elasticity/revenue, and GDP-style charts rather than repeating one figure pattern.
 """
+    concept_instruction = ""
+    if required_concepts:
+        readable_concepts = ", ".join(concept.replace("_", " ") for concept in required_concepts)
+        concept_instruction = (
+            f"This batch must include one distinct question for each of these concept families, in order: {readable_concepts}. "
+            "Use the topic_tag to name the specific concept tested.\n\n"
+        )
+    repair_instruction = (
+        f"A previous draft failed quality control for this reason: {repair_feedback}. Repair that failure explicitly in this new batch.\n\n"
+        if repair_feedback else ""
+    )
     return f"""You are an economics professor and assessment designer for an accelerated MBA/ABE beginning-economics course.
 
 Create {quantity} brand-new multiple-choice question(s) based ONLY on the course material below. Mimic its style, difficulty, vocabulary, topic distribution, and solution depth. Do not copy wording or simply reproduce a question. Change the scenario, values, or framing while testing the same economic principles. The requested difficulty is {difficulty}.
 
 {style_block}
+
+{concept_instruction}
+
+{repair_instruction}
 
 Make the questions distinct from one another. Rotate among core beginning-econ topics: scarcity, opportunity cost, PPF, comparative advantage, supply and demand, elasticity, consumer surplus, production costs, labor market, unemployment, GDP, inflation, real vs nominal, AD-AS, fiscal policy, and monetary policy. Use realistic MBA-style business applications where relevant, but keep the concepts at the introductory level. Avoid reusing the same exact scenario pattern, graph family, data-table family, or wording structure more than once. Each question must feel fresh, not templated.
 
@@ -731,6 +920,8 @@ When a question depends on a schedule, dataset, cost table, demand/supply schedu
 
 Every question must include a learning object. objective names the single skill being practiced. hint gives one productive next step without revealing the answer letter or final result. worked_steps contains 2 to 4 short, ordered reasoning steps that lead to the answer. misconception explains why a tempting wrong approach fails. The learning material must be specific to the actual values, graph, or causal mechanism in that question, never generic study advice.
 
+Every question must also include an assessment object. cognitive_skill must be one of: definition, calculation, graph interpretation, comparative statics, policy reasoning, data interpretation, or business application. scenario_type must describe the setting in a few words. distractor_logic must contain exactly four short strings, one for each option A through D, explaining the misconception or reasoning represented by that option. answer_check must state the decisive formula, comparison, or causal chain used to verify the correct answer. Do not write generic filler in these fields; they must refer to the actual question.
+
 source_reference should briefly name the concept or pattern from the source material that this new question mirrors.
 
 COURSE MATERIAL:
@@ -738,12 +929,14 @@ COURSE MATERIAL:
 """
 
 
-def generate_questions(
+def _generate_questions_once(
     context_text: str,
     difficulty: str,
     api_key: str,
     question_count: int,
     question_style: str = "mixed",
+    required_concepts: list[str] | None = None,
+    repair_feedback: str = "",
 ) -> list[dict[str, Any]]:
     if not context_text.strip():
         raise ValueError("Upload at least one course PDF or DOCX before generating questions.")
@@ -754,7 +947,14 @@ def generate_questions(
     client = genai.Client(api_key=api_key.strip())
     response = client.models.generate_content(
         model="gemini-3.6-flash",
-        contents=build_prompt(context_text, difficulty, question_count, question_style),
+        contents=build_prompt(
+            context_text,
+            difficulty,
+            question_count,
+            question_style,
+            required_concepts,
+            repair_feedback,
+        ),
         config={
             "response_mime_type": "application/json",
             "response_schema": {
@@ -785,11 +985,53 @@ def generate_questions(
     ]
     if quality_issues:
         raise ValueError(f"Gemini returned a low-quality question batch: {quality_issues[0]}.")
-    return audit_questions(difficulty, api_key, questions)
+    assessment_issues = [
+        issue for question in questions for issue in assessment_contract_issues(question)
+    ]
+    if assessment_issues:
+        raise ValueError(f"Gemini returned an under-designed question batch: {assessment_issues[0]}.")
+    diversity_issues = question_batch_diversity_issues(
+        questions, question_style, required_concepts
+    )
+    if diversity_issues:
+        raise ValueError(f"Gemini returned an insufficiently diverse batch: {diversity_issues[0]}.")
+    return audit_questions(difficulty, api_key, questions, question_style, required_concepts)
+
+
+def generate_questions(
+    context_text: str,
+    difficulty: str,
+    api_key: str,
+    question_count: int,
+    question_style: str = "mixed",
+    required_concepts: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Generate once, then make one targeted repair attempt if quality gates reject it."""
+    first_error = "unknown quality-control failure"
+    for attempt in range(2):
+        try:
+            return _generate_questions_once(
+                context_text,
+                difficulty,
+                api_key,
+                question_count,
+                question_style,
+                required_concepts,
+                first_error if attempt else "",
+            )
+        except (ValueError, json.JSONDecodeError) as exc:
+            first_error = str(exc)
+            if attempt == 1:
+                raise
+    raise RuntimeError("Question generation ended without a result.")
 
 
 def audit_questions(
-    difficulty: str, api_key: str, questions: list[dict[str, Any]]
+    difficulty: str,
+    api_key: str,
+    questions: list[dict[str, Any]],
+    question_style: str = "mixed",
+    required_concepts: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Have Gemini independently recalculate answers before they enter the pool."""
     client = genai.Client(api_key=api_key.strip())
@@ -797,7 +1039,7 @@ def audit_questions(
 
 Independently solve every question in the candidate batch below. Check all arithmetic, economic definitions, graph or curve logic, the marked correct answer, and whether the explanation actually supports it. Use ONLY the course material as the style and topic reference. Return exactly one final object per candidate in the same order. Preserve a sound question, but correct any wrong option, answer letter, calculation, or explanation you find. Do not mention this review process in the returned fields. The difficulty is {difficulty}.
 
-Also enforce diversity: do not keep multiple questions that are near-duplicates of one another. Reject repetitive verbal patterns, repeated graph setups, and repeated table-only questions. Prefer a mix of graph interpretation, data comparison, policy reasoning, and calculation. Every final question should still be valid, but the set should feel varied and fresh. Require a specific learning object: one measurable objective, a non-revealing hint, 2 to 4 correct worked steps, and a misconception correction tied to a plausible distractor.
+Also enforce diversity and quality: do not keep multiple questions that are near-duplicates of one another. Reject repetitive verbal patterns, repeated graph setups, and repeated table-only questions. Prefer a mix of graph interpretation, data comparison, policy reasoning, and calculation. Check every distractor for plausibility and ensure only one option is defensible under the stated assumptions. Reject questions with missing assumptions, ambiguous wording, unsupported numbers, answer choices that differ only cosmetically, or explanations that do not prove the answer. Every final question should still be valid, but the set should feel varied and fresh. Require a specific learning object and assessment object as described in the generation instructions.
 
 Return only a JSON array matching the supplied question schema.
 
@@ -826,49 +1068,101 @@ CANDIDATE QUESTIONS:
         quality_issues = question_quality_issues(question)
         if quality_issues:
             raise ValueError(f"The answer review returned a low-quality question: {quality_issues[0]}.")
+        assessment_issues = assessment_contract_issues(question)
+        if assessment_issues:
+            raise ValueError(f"The answer review returned an under-designed question: {assessment_issues[0]}.")
         question["verified"] = True
+    diversity_issues = question_batch_diversity_issues(
+        audited, question_style, required_concepts
+    )
+    if diversity_issues:
+        raise ValueError(f"The answer review reduced batch diversity: {diversity_issues[0]}.")
     return audited
 
 
-def build_game_prompt(context_text: str, difficulty: str, track: str) -> str:
+def build_game_prompt(
+    context_text: str,
+    difficulty: str,
+    track: str,
+    repair_feedback: str = "",
+) -> str:
+    repair_instruction = (
+        f"A previous attempt failed validation for this exact reason: {repair_feedback}. Correct that issue in every affected round.\n\n"
+        if repair_feedback else ""
+    )
     return f"""You are designing Market Shock, a 10-round economics strategy game.
 
 Create exactly {GAME_ROUNDS} distinct, connected multiple-choice economics scenarios for the {track} track at {difficulty} difficulty. Base the concepts, vocabulary, calculations, and difficulty ONLY on the course material below. Each scenario should read like a consequential event in a fictional economy or business. Do not copy source questions.
+
+{repair_instruction}
 
 For each round, include a concise scenario_title and scenario_context, then a question with exactly four options. The correct choice is the economically sound decision or analysis. impact_profile describes changes to four health indicators when the answer is correct: growth, inflation (price stability), employment, and stability. Use integer values from -12 to 12 and include realistic trade-offs when appropriate. Ensure every correct answer, calculation, and explanation is internally consistent.
 
 Return only a JSON array matching the supplied schema.
 
 COURSE MATERIAL:
-{context_text[:120000]}
+{prompt_context_excerpt(context_text)}
 """
+
+
+def game_round_quality_issues(game_round: Any, round_number: int) -> list[str]:
+    if not isinstance(game_round, dict):
+        return [f"round {round_number} is not an object"]
+    issues: list[str] = []
+    required_text = ("scenario_title", "scenario_context", "question", "topic_tag", "explanation")
+    for field in required_text:
+        if not isinstance(game_round.get(field), str) or not game_round[field].strip():
+            issues.append(f"round {round_number} has missing {field}")
+    options = game_round.get("options")
+    if (
+        not isinstance(options, list)
+        or len(options) != 4
+        or any(not isinstance(option, str) or not option[:2] in {"A)", "B)", "C)", "D)"} for option in options)
+        or len(set(options)) != 4
+    ):
+        issues.append(f"round {round_number} must have four distinct A-D options")
+    if game_round.get("correct_answer") not in {"A", "B", "C", "D"}:
+        issues.append(f"round {round_number} has an invalid correct_answer")
+    impact = game_round.get("impact_profile")
+    if not isinstance(impact, dict):
+        issues.append(f"round {round_number} impact_profile is not an object")
+    else:
+        expected = set(GAME_STARTING_INDICATORS)
+        if set(impact) != expected:
+            issues.append(f"round {round_number} impact_profile keys must be {sorted(expected)}")
+        elif any(not isinstance(value, int) or not -12 <= value <= 12 for value in impact.values()):
+            issues.append(f"round {round_number} impact values must be integers from -12 to 12")
+    return issues
 
 
 def validate_game_rounds(rounds: list[dict[str, Any]], expected_count: int) -> None:
     if not isinstance(rounds, list) or len(rounds) != expected_count:
-        raise ValueError("Gemini returned an incomplete Market Shock game. Please try again.")
-    for game_round in rounds:
-        impact = game_round.get("impact_profile", {})
-        if (
-            not isinstance(game_round, dict)
-            or len(game_round.get("options", [])) != 4
-            or game_round.get("correct_answer") not in {"A", "B", "C", "D"}
-            or any(not isinstance(option, str) or option[:2] not in {"A)", "B)", "C)", "D)"} for option in game_round.get("options", []))
-            or set(impact) != set(GAME_STARTING_INDICATORS)
-            or any(not isinstance(value, int) or not -12 <= value <= 12 for value in impact.values())
-        ):
-            raise ValueError("Gemini returned an invalid Market Shock round. Please try again.")
+        actual = len(rounds) if isinstance(rounds, list) else "non-list response"
+        raise ValueError(f"Market Shock expected {expected_count} rounds but received {actual}.")
+    issues = [
+        issue
+        for round_number, game_round in enumerate(rounds, start=1)
+        for issue in game_round_quality_issues(game_round, round_number)
+    ]
+    if issues:
+        raise ValueError(f"Market Shock validation failed: {issues[0]}.")
 
 
 def audit_game_rounds(
-    difficulty: str, track: str, api_key: str, rounds: list[dict[str, Any]]
+    difficulty: str,
+    track: str,
+    api_key: str,
+    rounds: list[dict[str, Any]],
+    repair_feedback: str = "",
 ) -> list[dict[str, Any]]:
     client = genai.Client(api_key=api_key.strip())
     response = client.models.generate_content(
         model="gemini-3.6-flash",
         contents=f"""You are the answer-key reviewer for the {track} Market Shock game.
 
-Independently solve each candidate round below. Correct any wrong answer letter, arithmetic, economic explanation, scenario logic, or impact_profile that contradicts the economically sound decision. Impact values represent indicator health, so higher inflation means better price stability. Preserve valid rounds and return exactly {len(rounds)} final rounds in the same order. Use ONLY the course material as a topic and style reference.
+Independently solve each candidate round below. Correct any wrong answer letter, arithmetic, economic explanation, scenario logic, or impact_profile that contradicts the economically sound decision. Impact values represent indicator health, so higher inflation means better price stability. Preserve valid rounds and return exactly {len(rounds)} final rounds in the same order. Use ONLY the course material as a topic and style reference. Every final round must have four distinct A-D options, all four impact_profile keys, and integer impacts from -12 to 12.
+
+{f"The prior review failed for this reason: {repair_feedback}. Correct it explicitly." if repair_feedback else ""}
 
 Return only a JSON array matching the supplied game-round schema.
 
@@ -888,15 +1182,19 @@ CANDIDATE ROUNDS:
     return audited
 
 
-def generate_game_rounds(
-    context_text: str, difficulty: str, track: str, api_key: str
+def _generate_game_rounds_once(
+    context_text: str,
+    difficulty: str,
+    track: str,
+    api_key: str,
+    repair_feedback: str = "",
 ) -> list[dict[str, Any]]:
     if not api_key.strip():
         raise ValueError("A Gemini API key must be configured before starting a game.")
     client = genai.Client(api_key=api_key.strip())
     response = client.models.generate_content(
         model="gemini-3.6-flash",
-        contents=build_game_prompt(context_text, difficulty, track),
+        contents=build_game_prompt(context_text, difficulty, track, repair_feedback),
         config={
             "response_mime_type": "application/json",
             "response_schema": {"type": "array", "items": GAME_ROUND_SCHEMA},
@@ -905,7 +1203,25 @@ def generate_game_rounds(
     )
     rounds = json.loads(response.text or "")
     validate_game_rounds(rounds, GAME_ROUNDS)
-    return audit_game_rounds(difficulty, track, api_key, rounds)
+    return audit_game_rounds(difficulty, track, api_key, rounds, repair_feedback)
+
+
+def generate_game_rounds(
+    context_text: str, difficulty: str, track: str, api_key: str
+) -> list[dict[str, Any]]:
+    """Generate Market Shock once, then retry once with field-level repair feedback."""
+    first_error = "unknown Market Shock validation failure"
+    for attempt in range(2):
+        try:
+            return _generate_game_rounds_once(
+                context_text, difficulty, track, api_key,
+                first_error if attempt else "",
+            )
+        except (ValueError, json.JSONDecodeError) as exc:
+            first_error = str(exc)
+            if attempt == 1:
+                raise
+    raise RuntimeError("Market Shock generation ended without a result.")
 
 
 def load_saved_game_rounds(
@@ -926,7 +1242,11 @@ def load_saved_game_rounds(
         }).mappings().all()
     rounds = []
     for row in rows:
-        game_round = json.loads(row["round_json"])
+        try:
+            game_round = json.loads(row["round_json"])
+            validate_game_rounds([game_round], 1)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
         game_round["bank_id"] = row["id"]
         rounds.append(game_round)
     return rounds
@@ -1129,7 +1449,7 @@ def fill_question_pool(api_key: str, minimum: int = QUESTION_POOL_TARGET) -> Non
         question for question in saved_questions
         if question.get("bank_id") not in saved_question_ids
     ]
-    st.session_state.question_pool.extend(order_question_pool(reusable_questions)[:missing])
+    st.session_state.question_pool.extend(select_balanced_pool(reusable_questions, missing))
     missing = minimum - len(st.session_state.question_pool)
     if missing <= 0:
         st.session_state.question_pool = order_question_pool(st.session_state.question_pool)
@@ -1140,12 +1460,14 @@ def fill_question_pool(api_key: str, minimum: int = QUESTION_POOL_TARGET) -> Non
             question_style = next_question_style()
         elif question_style == "mixed" and len(st.session_state.question_pool) % 2 == 0:
             question_style = "graph_heavy"
+        required_concepts = next_generation_concepts(missing)
         generated_questions = generate_questions(
             st.session_state.course_context,
             st.session_state.difficulty,
             api_key,
             missing,
             question_style=question_style,
+            required_concepts=required_concepts,
         )
         st.session_state.question_pool.extend(save_questions_to_bank(
             signature,
@@ -1160,7 +1482,8 @@ def take_pooled_question(api_key: str) -> dict[str, Any]:
         fill_question_pool(api_key, minimum=QUESTION_POOL_TARGET)
     elif len(st.session_state.question_pool) <= QUESTION_POOL_REFILL_THRESHOLD:
         fill_question_pool(api_key, minimum=QUESTION_POOL_TARGET)
-    question = st.session_state.question_pool.pop(0)
+    question = _next_diverse_pool_question(st.session_state.question_pool)
+    st.session_state.question_pool.remove(question)
     mark_question_served(question)
     _note_question_seen(question)
     st.session_state.active_question = question
@@ -1540,6 +1863,90 @@ def learning_material(question: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+CONCEPT_BRIEFINGS = {
+    "scarcity_ppf": (
+        "Scarcity and the PPF",
+        "Resources are limited, so every choice has an opportunity cost. Points on a PPF are productively efficient; points inside are inefficient; points outside are unattainable with current resources and technology.",
+        "Ask what is being given up, then use the PPF's position and slope to distinguish feasibility, efficiency, and opportunity cost.",
+    ),
+    "trade": (
+        "Comparative Advantage",
+        "Trade can benefit both parties when each specializes in the good with the lower opportunity cost, even if one party is more productive at producing both goods.",
+        "Calculate opportunity cost before comparing output levels. Absolute productivity is not the same as comparative advantage.",
+    ),
+    "supply_demand": (
+        "Supply, Demand, and Equilibrium",
+        "A shift in demand or supply changes equilibrium price and quantity. A movement along a curve comes from a price change; a curve shift comes from a non-price determinant.",
+        "Identify which curve changes, determine the direction of the shift, and then trace the new intersection.",
+    ),
+    "elasticity": (
+        "Elasticity and Responsiveness",
+        "Elasticity measures percentage responsiveness. For demand, the absolute value determines whether quantity responds more, less, or proportionally to price; the total-revenue result follows from that comparison.",
+        "Compare percentage changes, not raw changes, and remember that the sign of demand elasticity is usually negative while the classification uses its magnitude.",
+    ),
+    "production_costs": (
+        "Production Costs",
+        "In the short run, total fixed cost does not change with output. Total variable cost is total cost minus fixed cost; average variable cost divides variable cost by output; marginal cost measures the change in total cost per additional unit.",
+        "Start with TC at zero output to find fixed cost, then choose the correct total, average, or change formula for what the question asks.",
+    ),
+    "labor": (
+        "Labor Markets",
+        "Firms demand labor because workers produce revenue. Workers supply labor in exchange for wages, and equilibrium determines the wage and employment level in the model.",
+        "Keep the axes straight: wage is the price of labor and employment is the quantity. Then identify whether the shock changes labor demand, labor supply, or both.",
+    ),
+    "gdp_growth": (
+        "GDP and Real Growth",
+        "GDP measures the market value of final goods and services produced domestically. Real GDP removes price-level changes so production can be compared across time.",
+        "Separate nominal changes from real changes and remember the expenditure identity: consumption plus investment plus government spending plus net exports.",
+    ),
+    "inflation": (
+        "Inflation and Price Indices",
+        "Inflation is a sustained increase in the general price level. A price index or deflator compares the cost of a basket or output bundle across periods.",
+        "Check whether the question asks for a level, a percentage change, or a real value adjusted for prices.",
+    ),
+    "macro_policy": (
+        "Aggregate Demand and Policy",
+        "Fiscal and monetary policy affect aggregate demand. In the short run, demand shifts can change both real output and the price level; long-run productive capacity is a separate question.",
+        "Classify the policy or shock first, then determine whether AD, SRAS, or LRAS moves and what happens to output and prices.",
+    ),
+    "market_structure": (
+        "Market Structure",
+        "The number of firms, barriers to entry, and product differentiation shape market power. These features affect pricing, output, and efficiency.",
+        "Identify the market structure before applying the firm's decision rule; do not assume every firm is a price taker.",
+    ),
+}
+
+
+def concept_briefing(question: dict[str, Any]) -> tuple[str, str, str]:
+    family = question_concept_family(question)
+    return CONCEPT_BRIEFINGS.get(
+        family,
+        (
+            family.replace("_", " ").title(),
+            "Use the definitions, assumptions, and relationships from the course material to connect the facts in the scenario to the answer.",
+            "Name the concept first, then trace the direction of the relevant change before calculating or choosing.",
+        ),
+    )
+
+
+def learning_mastery_summary() -> pd.DataFrame:
+    families = []
+    for family in CORE_CONCEPT_FAMILIES:
+        attempts = [
+            attempt for attempt in st.session_state.history
+            if question_concept_family({"topic_tag": attempt.get("topic", "")}) == family
+        ]
+        total = len(attempts)
+        correct = sum(attempt["is_correct"] for attempt in attempts)
+        families.append({
+            "Concept": family.replace("_", " ").title(),
+            "Attempts": total,
+            "Accuracy": round(correct / total * 100) if total else None,
+            "Status": "Needs practice" if total and correct / total < 0.7 else "Building" if total else "Not started",
+        })
+    return pd.DataFrame(families)
+
+
 def question_quality_issues(question: dict[str, Any]) -> list[str]:
     issues: list[str] = []
     if len(question.get("question", "").strip()) < 40:
@@ -1558,6 +1965,38 @@ def question_quality_issues(question: dict[str, Any]) -> list[str]:
         elif not isinstance(learning.get("worked_steps"), list) or not 2 <= len(learning["worked_steps"]) <= 4:
             issues.append("worked steps must contain 2 to 4 items")
     return issues
+
+
+ALLOWED_COGNITIVE_SKILLS = {
+    "definition",
+    "calculation",
+    "graph interpretation",
+    "comparative statics",
+    "policy reasoning",
+    "data interpretation",
+    "business application",
+}
+
+
+def assessment_contract_issues(question: dict[str, Any]) -> list[str]:
+    assessment = question.get("assessment")
+    if not isinstance(assessment, dict):
+        return ["assessment metadata is missing"]
+    skill = str(assessment.get("cognitive_skill", "")).strip().lower()
+    if skill not in ALLOWED_COGNITIVE_SKILLS:
+        return ["assessment cognitive_skill is invalid"]
+    if len(str(assessment.get("scenario_type", "")).strip()) < 3:
+        return ["assessment scenario_type is missing"]
+    distractors = assessment.get("distractor_logic")
+    if (
+        not isinstance(distractors, list)
+        or len(distractors) != 4
+        or any(not isinstance(item, str) or len(item.strip()) < 8 for item in distractors)
+    ):
+        return ["assessment must explain all four distractors"]
+    if len(str(assessment.get("answer_check", "")).strip()) < 15:
+        return ["assessment answer_check is too brief"]
+    return []
 
 
 def learning_priority(question: dict[str, Any]) -> tuple[int, int, int, int, str]:
@@ -1604,7 +2043,10 @@ def learning_focus_summary() -> tuple[str, int, int] | None:
 def take_learning_question(api_key: str) -> dict[str, Any]:
     if not st.session_state.question_pool or len(st.session_state.question_pool) <= QUESTION_POOL_REFILL_THRESHOLD:
         fill_question_pool(api_key, minimum=QUESTION_POOL_TARGET)
-    question = min(st.session_state.question_pool, key=learning_priority)
+    question = _next_diverse_pool_question(
+        st.session_state.question_pool,
+        priority=learning_priority,
+    )
     st.session_state.question_pool.remove(question)
     mark_question_served(question)
     _note_question_seen(question)
@@ -1612,6 +2054,9 @@ def take_learning_question(api_key: str) -> dict[str, Any]:
     st.session_state.learning_answer = None
     st.session_state.learning_revealed = False
     st.session_state.learning_hint_visible = False
+    st.session_state.learning_confidence = "Not sure yet"
+    st.session_state.learning_reflection = ""
+    st.session_state.learning_reflection_saved = False
     return question
 
 
@@ -1666,6 +2111,11 @@ def render_learning(api_key: str) -> None:
     if st.session_state.learning_question is None:
         st.markdown("## Learning mode")
         st.write("Work one verified question at a time. Ask for a hint before committing, then use the worked solution to correct the exact misconception behind a miss.")
+        mastery = learning_mastery_summary()
+        needs_practice = mastery[mastery["Status"] == "Needs practice"]
+        if not needs_practice.empty:
+            st.warning(f"Priority review: {needs_practice.iloc[0]['Concept']}")
+        st.dataframe(mastery, hide_index=True, use_container_width=True)
         if st.button("Start a learning card", type="primary"):
             try:
                 take_learning_question(api_key)
@@ -1676,9 +2126,13 @@ def render_learning(api_key: str) -> None:
 
     question = st.session_state.learning_question
     material = learning_material(question)
+    briefing_title, briefing, briefing_move = concept_briefing(question)
     st.markdown('<div class="question-panel">', unsafe_allow_html=True)
     st.markdown(f'<div class="question-number">LEARNING CARD · {question.get("topic_tag", "ECONOMICS").upper()}</div>', unsafe_allow_html=True)
     st.caption(f"Skill: {material['objective']}")
+    with st.expander(f"Before you answer: {briefing_title}", expanded=True):
+        st.write(briefing)
+        st.caption(f"Look for: {briefing_move}")
     st.markdown(f'<div class="question-text">{question_display_text(question)}</div>', unsafe_allow_html=True)
     render_question_visuals(question)
     if not st.session_state.learning_revealed and not st.session_state.learning_hint_visible:
@@ -1687,6 +2141,12 @@ def render_learning(api_key: str) -> None:
             st.rerun()
     if st.session_state.learning_hint_visible and not st.session_state.learning_revealed:
         st.info(material["hint"])
+    st.session_state.learning_confidence = st.select_slider(
+        "How confident are you before answering?",
+        options=["Not sure yet", "Somewhat confident", "Very confident"],
+        value=st.session_state.learning_confidence,
+        key=f"confidence_{id(question)}",
+    )
     selected = st.radio("Choose an answer", question.get("options", []), key=f"learning_answer_{id(question)}", label_visibility="collapsed")
     selected_letter = selected[:1] if selected else ""
     if not st.session_state.learning_revealed:
@@ -1708,6 +2168,17 @@ def render_learning(api_key: str) -> None:
         for step_number, step in enumerate(material["worked_steps"], start=1):
             st.markdown(f"{step_number}. {step}")
         st.markdown(f'<div class="explanation"><strong>Watch for this</strong><br>{material["misconception"]}</div>', unsafe_allow_html=True)
+        reflection = st.text_area(
+            "Teach it back in one sentence: what rule makes the answer correct?",
+            value=st.session_state.learning_reflection,
+            key=f"reflection_{id(question)}",
+            height=90,
+        )
+        if st.button("Save teach-back", key=f"save_reflection_{id(question)}"):
+            st.session_state.learning_reflection = reflection.strip()
+            st.session_state.learning_reflection_saved = bool(reflection.strip())
+            if st.session_state.learning_reflection_saved:
+                st.success("Teach-back saved for this card. The next card will target your weaker concepts.")
         st.markdown(f'<p class="small-mono">MIMICS: {question.get("source_reference", "Course material")}</p>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
     if st.session_state.learning_revealed and st.button("Next learning card", type="primary"):
